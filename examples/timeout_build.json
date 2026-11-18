@@ -1,0 +1,11 @@
+{
+  "name": "example-timeout",
+  "steps": [
+    {
+      "id": "runs-too-long",
+      "command": "echo '开始长时间任务' && sleep 60 && echo '不应看到这行'",
+      "depends_on": [],
+      "timeout_seconds": 2
+    }
+  ]
+}

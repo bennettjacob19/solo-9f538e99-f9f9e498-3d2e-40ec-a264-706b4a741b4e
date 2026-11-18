@@ -1,0 +1,29 @@
+{
+  "name": "example-failure-with-skip",
+  "steps": [
+    {
+      "id": "good-branch",
+      "command": "echo '独立分支：正常执行' && sleep 0.2 && exit 0",
+      "depends_on": [],
+      "timeout_seconds": 10
+    },
+    {
+      "id": "broken-compile",
+      "command": "echo '模拟编译失败' && exit 7",
+      "depends_on": [],
+      "timeout_seconds": 10
+    },
+    {
+      "id": "downstream-of-failure",
+      "command": "echo '这一步不应被执行（上游失败，后代跳过）'",
+      "depends_on": ["broken-compile"],
+      "timeout_seconds": 10
+    },
+    {
+      "id": "grandchild-skipped",
+      "command": "echo '这一步同样不应被执行'",
+      "depends_on": ["downstream-of-failure"],
+      "timeout_seconds": 10
+    }
+  ]
+}

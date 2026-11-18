@@ -1,0 +1,29 @@
+{
+  "name": "example-success-firmware",
+  "steps": [
+    {
+      "id": "prepare",
+      "command": "mkdir -p out && echo 'firmware source prepared' > out/source.txt && cat out/source.txt",
+      "depends_on": [],
+      "timeout_seconds": 10
+    },
+    {
+      "id": "compile",
+      "command": "echo 'compiling firmware...' && sleep 0.5 && echo 'build ok' > out/build.txt",
+      "depends_on": ["prepare"],
+      "timeout_seconds": 30
+    },
+    {
+      "id": "unit-test",
+      "command": "echo 'running unit tests...' && test -f out/build.txt && echo 'all tests passed'",
+      "depends_on": ["compile"],
+      "timeout_seconds": 30
+    },
+    {
+      "id": "package",
+      "command": "echo 'packaging artifact...' && tar -czf out/firmware.tar.gz -C out build.txt source.txt && ls -l out",
+      "depends_on": ["unit-test"],
+      "timeout_seconds": 30
+    }
+  ]
+}

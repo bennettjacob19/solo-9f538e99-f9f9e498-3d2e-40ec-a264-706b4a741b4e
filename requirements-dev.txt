@@ -1,0 +1,5 @@
+# 本地测试/演示用额外依赖（镜像内不需要）
+-r requirements.txt
+httpx==0.28.1
+pytest==9.2.0
+PyYAML==6.0.2

@@ -1,0 +1,11 @@
+{
+  "name": "example-lingering-child",
+  "steps": [
+    {
+      "id": "spawn-slow-child",
+      "command": "echo '主命令派生一个慢子进程后立即退出'; sleep 300 & echo $! > slow_child.pid; echo '主命令正常退出(0)，但子进程仍在'; exit 0",
+      "depends_on": [],
+      "timeout_seconds": 10
+    }
+  ]
+}
