@@ -1,0 +1,29 @@
+{
+  "name": "example-workdir-sabotage",
+  "steps": [
+    {
+      "id": "sabotage-prepare",
+      "command": "sleep 1; WD=\"$PIPELINE_DATA_DIR/workdir/$PIPELINE_BUILD_ID\"; mv \"$WD\" \"${WD}.gone\" && echo oops > \"$WD\"",
+      "depends_on": [],
+      "timeout_seconds": 10
+    },
+    {
+      "id": "independent-branch",
+      "command": "echo '无依赖分支：不依赖被破坏的步骤，在目录被替换前启动，应继续执行并成功'",
+      "depends_on": [],
+      "timeout_seconds": 10
+    },
+    {
+      "id": "package",
+      "command": "echo '依赖 sabotage-prepare：工作目录已被替换为普通文件，启动准备失败'",
+      "depends_on": ["sabotage-prepare"],
+      "timeout_seconds": 10
+    },
+    {
+      "id": "package-child",
+      "command": "echo '后代步骤：上游启动失败，应被跳过'",
+      "depends_on": ["package"],
+      "timeout_seconds": 10
+    }
+  ]
+}

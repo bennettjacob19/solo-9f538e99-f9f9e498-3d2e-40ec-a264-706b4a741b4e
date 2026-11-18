@@ -18,7 +18,7 @@ from typing import Any, Optional
 
 from . import config, proc
 from .db import Database
-from .models import BUILD_TERMINAL, BuildCreate, validate_dag
+from .models import BUILD_TERMINAL, STEP_TERMINAL, BuildCreate, validate_dag
 
 _STEP_FAIL_STATES = {"failed", "skipped", "cancelled", "interrupted"}
 
@@ -166,11 +166,15 @@ class Scheduler:
                     if task.done() and statuses[uid] not in _STEP_FAIL_STATES | {"succeeded"}:
                         try:
                             statuses[uid] = task.result()
-                        except Exception as exc:  # 任务异常按失败处理
+                        except Exception as exc:  # 任务异常按失败处理并落库
                             statuses[uid] = "failed"
+                            detail = f"步骤任务异常，按失败处理: {exc!r}"
                             self._append_log(
                                 by_id[uid]["log_path"],
-                                [f"[runner] 步骤任务异常: {exc!r}"],
+                                [f"[runner] {detail}"],
+                            )
+                            await self.db.set_step_status(
+                                by_id[uid]["id"], "failed", _now(), detail=detail
                             )
 
                 # 取消优先：未启动步骤不再启动，运行中的交给步骤任务自行终止
@@ -224,9 +228,28 @@ class Scheduler:
             )
             for (uid, _), result in zip(step_tasks, results):
                 if isinstance(result, Exception):
+                    detail = f"步骤任务异常，按失败处理: {result!r}"
                     statuses[uid] = "failed"
+                    self._append_log(by_id[uid]["log_path"], [f"[runner] {detail}"])
+                    await self.db.set_step_status(
+                        by_id[uid]["id"], "failed", _now(), detail=detail
+                    )
                 else:
                     statuses[uid] = result
+
+            # 防御性兜底：任何仍停留在非终态的步骤（理论上不应发生）一律判失败，
+            # 绝不允许带着 pending/running/cleaning_up 的步骤把整次构建确认为成功
+            final_rows = await self.db.get_steps(build_id)
+            for row in final_rows:
+                if row["status"] not in STEP_TERMINAL:
+                    fallback = (
+                        f"步骤未进入终态（实际为 {row['status']}），按失败处理，"
+                        "构建不确认为成功"
+                    )
+                    await self.db.set_step_status(
+                        row["id"], "failed", _now(), detail=fallback
+                    )
+                    self._append_log(row["log_path"], [f"[runner] {fallback}"])
 
             final_rows = await self.db.get_steps(build_id)
             final_statuses = [r["status"] for r in final_rows]
@@ -236,6 +259,9 @@ class Scheduler:
             elif "cancelled" in final_statuses:
                 final = "cancelled"
                 detail = "构建被取消"
+            elif "skipped" in final_statuses:
+                final = "failed"
+                detail = "存在被跳过的步骤（上游未成功），构建不确认为成功"
             else:
                 final = "succeeded"
                 detail = "全部步骤成功"
@@ -269,7 +295,6 @@ class Scheduler:
         command = row["command"]
         timeout = float(row["timeout_seconds"])
         workdir = config.WORKDIR_ROOT / str(build_id)
-        workdir.mkdir(parents=True, exist_ok=True)
         log_path = Path(row["log_path"])
         log_lines = [
             f"[runner] build={build_id} step={step_uid} 开始",
@@ -284,63 +309,99 @@ class Scheduler:
             "PIPELINE_BUILD_ID": str(build_id),
             "PIPELINE_STEP_ID": step_uid,
         }
-        log_f = open(log_path, "ab", buffering=0)
+
+        # ---- 启动准备阶段：任何异常都属于"步骤无法启动"，必须落库为 failed ----
+        try:
+            workdir.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            detail = (
+                f"步骤启动失败：无法准备工作目录 {workdir}: "
+                f"[{type(exc).__name__}] {exc}"
+            )
+            return await self._fail_step(step_pk, log_path, detail)
+
+        try:
+            log_f = open(log_path, "ab", buffering=0)
+        except OSError as exc:
+            detail = (
+                f"步骤启动失败：无法打开日志文件 {log_path}: "
+                f"[{type(exc).__name__}] {exc}"
+            )
+            return await self._fail_step(step_pk, log_path, detail)
+
+        process = None
+        pgid: Optional[int] = None
         try:
             try:
                 process, pid, pgid, starttime = await proc.spawn(
                     command, workdir, env, log_f, log_f
                 )
             except Exception as exc:  # 命令本身都无法启动
+                detail = f"步骤启动失败：进程无法启动: [{type(exc).__name__}] {exc}"
+                return await self._fail_step(step_pk, log_path, detail)
+
+            try:
+                await self.db.set_step_process(step_pk, pid, pgid, starttime, _now())
+                cancel_event = self._build_events[build_id]
+                outcome, detail = await self._watch(process, timeout, cancel_event)
+
+                # 进入清理阶段即对外可见：终态尚未确认、名额仍占用
                 await self.db.set_step_status(
-                    step_pk, "failed", _now(), detail=f"进程启动失败: {exc}"
+                    step_pk, "cleaning_up", _now(), detail=detail
                 )
-                self._append_log(log_path, [f"[runner] 进程启动失败: {exc}"])
-                return "failed"
-
-            await self.db.set_step_process(step_pk, pid, pgid, starttime, _now())
-            cancel_event = self._build_events[build_id]
-            outcome, detail = await self._watch(process, timeout, cancel_event)
-
-            # 进入清理阶段即对外可见：终态尚未确认、名额仍占用
-            await self.db.set_step_status(
-                step_pk, "cleaning_up", _now(), detail=detail
-            )
-            leftovers_before = await asyncio.to_thread(
-                proc.list_pgid_members, pgid
-            )
-            had_leftovers = bool(leftovers_before)
-            cleanup_log: list[str] = []
-            if outcome == "timeout":
-                reason = "步骤超时"
-            elif outcome == "cancelled":
-                reason = "构建取消"
-            else:
-                reason = "主命令退出后检查残留子进程"
-            cleared = await proc.terminate_process_group(
-                process, pgid, reason, cleanup_log
-            )
-            self._append_log(log_path, cleanup_log)
-            exit_code = process.returncode
-
-            if not cleared:
-                status, final_detail = (
-                    "failed",
-                    f"{detail or ''}; 进程组在硬等上限内未清空".strip("; "),
+                leftovers_before = await asyncio.to_thread(
+                    proc.list_pgid_members, pgid
                 )
-            elif outcome == "timeout":
-                status, final_detail = "failed", detail
-            elif outcome == "cancelled":
-                status, final_detail = "cancelled", detail
-            elif had_leftovers:
-                status = "failed"
-                final_detail = (
-                    f"主命令已退出(exit={exit_code})，但检测到遗留子进程，"
-                    "进程组清理后按失败处理"
+                had_leftovers = bool(leftovers_before)
+                cleanup_log: list[str] = []
+                if outcome == "timeout":
+                    reason = "步骤超时"
+                elif outcome == "cancelled":
+                    reason = "构建取消"
+                else:
+                    reason = "主命令退出后检查残留子进程"
+                cleared = await proc.terminate_process_group(
+                    process, pgid, reason, cleanup_log
                 )
-            elif exit_code == 0:
-                status, final_detail = "succeeded", None
-            else:
-                status, final_detail = "failed", f"命令以非零状态退出: {exit_code}"
+                self._append_log(log_path, cleanup_log)
+                exit_code = process.returncode
+
+                if not cleared:
+                    status, final_detail = (
+                        "failed",
+                        f"{detail or ''}; 进程组在硬等上限内未清空".strip("; "),
+                    )
+                elif outcome == "timeout":
+                    status, final_detail = "failed", detail
+                elif outcome == "cancelled":
+                    status, final_detail = "cancelled", detail
+                elif had_leftovers:
+                    status = "failed"
+                    final_detail = (
+                        f"主命令已退出(exit={exit_code})，但检测到遗留子进程，"
+                        "进程组清理后按失败处理"
+                    )
+                elif exit_code == 0:
+                    status, final_detail = "succeeded", None
+                else:
+                    status, final_detail = "failed", f"命令以非零状态退出: {exit_code}"
+            except asyncio.CancelledError:
+                # 构建任务被取消等极端情况：进程组必须先排空，再判 cancelled
+                if pgid is not None:
+                    cleanup_log: list[str] = ["[runner] 步骤任务被取消，强制清理进程组"]
+                    await proc.terminate_process_group(process, pgid, "任务取消", cleanup_log)
+                    self._append_log(log_path, cleanup_log)
+                raise
+            except Exception as exc:
+                # spawn 之后的任何意外：先保证进程组清空，再落库 failed，
+                # 绝不让异常裸奔导致步骤永远停在 running/cleaning_up
+                detail = f"步骤执行异常，清理进程组后按失败处理: [{type(exc).__name__}] {exc}"
+                self._append_log(log_path, [f"[runner] {detail}"])
+                if pgid is not None:
+                    cleanup_log: list[str] = []
+                    await proc.terminate_process_group(process, pgid, "执行异常清理", cleanup_log)
+                    self._append_log(log_path, cleanup_log)
+                return await self._fail_step(step_pk, log_path, detail)
 
             await self.db.set_step_status(
                 step_pk,
@@ -359,6 +420,12 @@ class Scheduler:
             return status
         finally:
             log_f.close()
+
+    async def _fail_step(self, step_pk: int, log_path: Path, detail: str) -> str:
+        """启动准备期/兜底异常的统一收尾：原因落库且写入日志，状态恒为 failed。"""
+        self._append_log(log_path, [f"[runner] {detail}"])
+        await self.db.set_step_status(step_pk, "failed", _now(), detail=detail)
+        return "failed"
 
     async def _watch(
         self, process: Any, timeout: float, cancel_event: asyncio.Event

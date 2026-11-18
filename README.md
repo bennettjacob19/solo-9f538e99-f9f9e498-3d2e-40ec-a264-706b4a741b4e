@@ -12,6 +12,7 @@ FastAPI + SQLite 实现的 DAG 构建流水线：接收至多 12 步的 JSON DAG
 | 全局最多两步并行 | 单 worker 内 `asyncio.Semaphore(2)`，名额覆盖步骤全生命周期 |
 | 依赖全成功才启动 | 调度器按 DAG 推进，依赖未全部 `succeeded` 不启动 |
 | 失败使后代跳过，独立分支继续 | 上游出现失败/取消/中断即置后代 `skipped`；无依赖关系的分支不受影响 |
+| 步骤启动准备期异常的收尾 | 工作目录无法准备（如被替换为普通文件）、日志无法打开、进程无法启动均落库为 `failed` 且原因可通过 `detail`/日志查询；后代跳过、独立分支继续，整次构建不得为成功 |
 | 整次取消停止所有未完成步骤 | `POST /builds/{id}/cancel`，per-build 事件即时通知；未启动步骤不再启动 |
 | 超时/取消终止对应进程组 | 每步 `start_new_session=True` 独立进程组，`killpg(PGID, SIGTERM→SIGKILL)` |
 | 主命令退出后慢子进程清理并判失败 | 退出后扫描 `/proc` 检查组内残留，有残留即清理且步骤判 `failed` |
@@ -54,6 +55,8 @@ PIPELINE_DATA_DIR=./data .venv/bin/python -m uvicorn app.main:app --host 0.0.0.0
 - `failure_build.json` — 编译失败、后代跳过、独立分支继续
 - `slow_child_build.json` — 主命令退出 0 但派生 `sleep 300` 慢子进程，验证清理与判失败
 - `timeout_build.json` — 2s 超时终止睡眠 60s 的进程组
+- `workdir_sabotage_build.json` — prepare 把工作目录移走并在原位留下普通文件，
+  验证依赖步骤启动准备失败可查询、后代跳过、无依赖分支继续、整次构建判失败
 
 一键演示（API 已启动时）：
 
@@ -96,6 +99,10 @@ curl -s -X POST localhost:8000/builds/1/cancel
    后来构建进程不会被误杀。组长已死但组内仍有成员时，因 PGID 不可能被复用，
    残留成员仍会被清理。
 5. 恢复在应用开始接受请求前完成；旧构建统一置 `interrupted`，调度不恢复。
+6. 步骤启动准备（工作目录创建、日志文件打开、进程 spawn）抛出的任何异常都被
+   捕获并落库为 `failed`，失败原因写入步骤 `detail` 与日志；spawn 之后的意外
+   先强制清空进程组再判失败。构建终态确认前还会对账所有步骤，任何残留非终态
+   步骤一律兜底判失败，杜绝"步骤卡住、整次却成功"。
 
 ## 测试
 
@@ -106,7 +113,9 @@ curl -s -X POST localhost:8000/builds/1/cancel
 - `tests/test_validation.py`：DAG 校验、12 步上限、超时正数、进程身份识别。
 - `tests/test_integration.py`：以真实 uvicorn 子进程端到端验证成功、失败跳过、
   慢子进程清理判失败、超时、并行上限 2、整次取消、重复取消幂等、慢清理不占
-  另一名额、重启恢复（含不误杀后来构建）、错误请求与文档接口。
+  另一名额、重启恢复（含不误杀后来构建）、启动准备期异常收尾（工作目录被替换
+  为普通文件：失败原因可查询、后代跳过、独立分支继续、整次不判成功，且结论
+  重启后仍可查）、错误请求与文档接口。
 
 ## 配置（环境变量）
 

@@ -399,3 +399,117 @@ def test_health_and_docs(server):
     assert health["status"] == "ok" and health["max_parallel"] == 2
     assert server.client.get("/docs").status_code == 200
     assert server.client.get("/openapi.json").status_code == 200
+
+
+# -------------------------------------- 10. 启动准备期异常：工作目录被替换为普通文件
+
+def _sabotage_payload(name: str) -> dict:
+    """prepare 把构建工作目录移走并在原位留下普通文件。
+
+    - sabotage 先 sleep，保证同批次独立分支在破坏前完成 workdir 准备；
+    - package 依赖 sabotage，调度时 workdir 已是普通文件，mkdir 必失败；
+    - child 是 package 的后代，必须被跳过。
+    """
+    return {
+        "name": name,
+        "steps": [
+            step(
+                "sabotage",
+                "sleep 0.5; WD=$PIPELINE_DATA_DIR/workdir/$PIPELINE_BUILD_ID; "
+                'mv "$WD" "${WD}.gone" && echo oops > "$WD"',
+            ),
+            step("independent", "echo independent-branch-ok"),
+            step("package", "echo packaging", ["sabotage"]),
+            step("child", "echo never", ["package"]),
+        ],
+    }
+
+
+def test_startup_failure_when_workdir_replaced_by_file(server):
+    bid = submit(server.client, "workdir-sabotage", _sabotage_payload("x")["steps"])
+    detail = wait_build(server.client, bid, timeout=30)
+
+    # 整次构建不得为成功
+    assert detail["status"] == "failed"
+    sm = step_map(detail)
+    # 破坏命令自身退出 0
+    assert sm["sabotage"]["status"] == "succeeded"
+    # 无依赖的独立分支继续执行并成功
+    assert sm["independent"]["status"] == "succeeded"
+    indep_log = server.client.get(f"/builds/{bid}/steps/independent/logs").json()
+    assert "independent-branch-ok" in command_output(indep_log)
+    # 无法启动的步骤判失败，且原因可查询
+    assert sm["package"]["status"] == "failed"
+    assert sm["package"]["exit_code"] is None  # 命令根本没启动，无退出码
+    assert "工作目录" in (sm["package"]["detail"] or "")
+    assert "步骤启动失败" in (sm["package"]["detail"] or "")
+    # 后代跳过
+    assert sm["child"]["status"] == "skipped"
+    assert "上游步骤未成功" in (sm["child"]["detail"] or "")
+    child_log = server.client.get(f"/builds/{bid}/steps/child/logs").json()
+    assert "never" not in command_output(child_log)
+    # 失败原因同样可通过日志接口查询
+    pkg_log = server.client.get(f"/builds/{bid}/steps/package/logs").json()
+    assert pkg_log["status"] == "failed"
+    assert "步骤启动失败" in pkg_log["content"]
+    assert "FileExistsError" in pkg_log["content"] or "工作目录" in pkg_log["content"]
+
+    # 终态已持久化：直接查 SQLite，API 重启后结论不依赖内存状态
+    import sqlite3
+
+    conn = sqlite3.connect(server.data_dir / "pipeline.db")
+    try:
+        db_statuses = dict(
+            conn.execute(
+                "SELECT step_uid, status FROM steps WHERE build_id=?", (bid,)
+            ).fetchall()
+        )
+        assert db_statuses == {
+            "sabotage": "succeeded",
+            "independent": "succeeded",
+            "package": "failed",
+            "child": "skipped",
+        }
+        assert conn.execute(
+            "SELECT status FROM builds WHERE id=?", (bid,)
+        ).fetchone()[0] == "failed"
+    finally:
+        conn.close()
+
+
+def test_startup_failure_conclusion_survives_restart(tmp_path_factory):
+    data_dir = tmp_path_factory.mktemp("sabotage-restart")
+    port = _free_port()
+    srv = ServerHarness(data_dir, port)
+    srv.start()
+    try:
+        bid = submit(srv.client, "sabotage-restart", _sabotage_payload("x")["steps"])
+        detail = wait_build(srv.client, bid, timeout=30)
+        assert detail["status"] == "failed"
+        sm = step_map(detail)
+        assert sm["package"]["status"] == "failed"
+        assert sm["child"]["status"] == "skipped"
+    finally:
+        srv.stop()
+
+    # 同数据目录重启：终态结论必须原样可查，不恢复调度、不重跑步骤
+    srv2 = ServerHarness(data_dir, port)
+    srv2.start()
+    try:
+        detail = srv2.client.get(f"/builds/{bid}").json()
+        assert detail["status"] == "failed"
+        assert detail["detail"] == "存在失败步骤"
+        sm = step_map(detail)
+        assert sm["package"]["status"] == "failed"
+        assert "步骤启动失败" in (sm["package"]["detail"] or "")
+        assert sm["child"]["status"] == "skipped"
+        assert sm["independent"]["status"] == "succeeded"
+        # 恢复报告不应把已终态构建算进去
+        assert srv2.client.get("/health").json()["recovery"]["builds"] == 0
+        # 重启后新构建仍可正常运行
+        new_id = submit(srv2.client, "after-sabotage-restart", [
+            step("z", "echo still-alive"),
+        ])
+        assert wait_build(srv2.client, new_id)["status"] == "succeeded"
+    finally:
+        srv2.stop()
